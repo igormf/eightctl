@@ -18,6 +18,7 @@ import (
 
 const (
 	defaultBaseURL = "https://client-api.8slp.net/v1"
+	defaultAppURL  = "https://app-api.8slp.net"
 	// Extracted from the official Eight Sleep Android app v7.39.17 (public client creds)
 	defaultClientID     = "0894c7f33bb94800a03f1f4df13a4f38"
 	defaultClientSecret = "f0954a3ed5763ba3d06834c73731a32f15f168f47d4f164751275def86db0c76"
@@ -37,12 +38,12 @@ type Client struct {
 
 	HTTP     *http.Client
 	BaseURL  string
+	AppURL   string
 	token    string
 	tokenExp time.Time
 }
 
 // New creates a Client.
-
 func New(email, password, userID, clientID, clientSecret string) *Client {
 	if clientID == "" {
 		clientID = defaultClientID
@@ -64,6 +65,7 @@ func New(email, password, userID, clientID, clientSecret string) *Client {
 		ClientSecret: clientSecret,
 		HTTP:         &http.Client{Timeout: 20 * time.Second, Transport: tr},
 		BaseURL:      defaultBaseURL,
+		AppURL:       defaultAppURL,
 	}
 }
 
@@ -99,6 +101,7 @@ func (c *Client) EnsureDeviceID(ctx context.Context) (string, error) {
 	}
 	var res struct {
 		User struct {
+			Devices       []string `json:"devices"`
 			CurrentDevice struct {
 				ID string `json:"id"`
 			} `json:"currentDevice"`
@@ -107,10 +110,14 @@ func (c *Client) EnsureDeviceID(ctx context.Context) (string, error) {
 	if err := c.do(ctx, http.MethodGet, "/users/me", nil, nil, &res); err != nil {
 		return "", err
 	}
-	if res.User.CurrentDevice.ID == "" {
+	if res.User.CurrentDevice.ID != "" {
+		c.DeviceID = res.User.CurrentDevice.ID
+		return c.DeviceID, nil
+	}
+	if len(res.User.Devices) == 0 {
 		return "", errors.New("no current device id")
 	}
-	c.DeviceID = res.User.CurrentDevice.ID
+	c.DeviceID = res.User.Devices[0]
 	return c.DeviceID, nil
 }
 
@@ -199,10 +206,14 @@ func (c *Client) requireUser(ctx context.Context) error {
 const maxRetries = 3
 
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, body any, out any) error {
-	return c.doRetry(ctx, method, path, query, body, out, 0)
+	return c.doRetryWithBase(ctx, c.BaseURL, method, path, query, body, out, 0)
 }
 
-func (c *Client) doRetry(ctx context.Context, method, path string, query url.Values, body any, out any, attempt int) error {
+func (c *Client) doApp(ctx context.Context, method, path string, query url.Values, body any, out any) error {
+	return c.doRetryWithBase(ctx, c.AppURL, method, path, query, body, out, 0)
+}
+
+func (c *Client) doRetryWithBase(ctx context.Context, baseURL, method, path string, query url.Values, body any, out any, attempt int) error {
 	if err := c.ensureToken(ctx); err != nil {
 		return err
 	}
@@ -214,7 +225,7 @@ func (c *Client) doRetry(ctx context.Context, method, path string, query url.Val
 		}
 		rdr = bytes.NewReader(b)
 	}
-	u := c.BaseURL + path
+	u := baseURL + path
 	if len(query) > 0 {
 		u += "?" + query.Encode()
 	}
@@ -227,9 +238,7 @@ func (c *Client) doRetry(ctx context.Context, method, path string, query url.Val
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Connection", "keep-alive")
 	req.Header.Set("User-Agent", "okhttp/4.9.3")
-	// Note: we intentionally do NOT set Accept-Encoding. Go's http.Transport
-	// handles gzip transparently when the header is absent. Setting it
-	// explicitly disables automatic decompression.
+	// Do not set Accept-Encoding explicitly; Go handles gzip transparently.
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -241,7 +250,7 @@ func (c *Client) doRetry(ctx context.Context, method, path string, query url.Val
 			return fmt.Errorf("rate limited after %d retries: %s %s", maxRetries, method, path)
 		}
 		time.Sleep(time.Duration(2*(attempt+1)) * time.Second)
-		return c.doRetry(ctx, method, path, query, body, out, attempt+1)
+		return c.doRetryWithBase(ctx, baseURL, method, path, query, body, out, attempt+1)
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		if attempt >= maxRetries {
@@ -252,7 +261,7 @@ func (c *Client) doRetry(ctx context.Context, method, path string, query url.Val
 		if err := c.ensureToken(ctx); err != nil {
 			return err
 		}
-		return c.doRetry(ctx, method, path, query, body, out, attempt+1)
+		return c.doRetryWithBase(ctx, baseURL, method, path, query, body, out, attempt+1)
 	}
 	if resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
@@ -266,21 +275,37 @@ func (c *Client) doRetry(ctx context.Context, method, path string, query url.Val
 
 // TurnOn powers device on.
 func (c *Client) TurnOn(ctx context.Context) error {
-	return c.setPower(ctx, true)
+	return c.TurnOnForUser(ctx, "")
 }
 
 // TurnOff powers device off.
 func (c *Client) TurnOff(ctx context.Context) error {
-	return c.setPower(ctx, false)
+	return c.TurnOffForUser(ctx, "")
 }
 
-func (c *Client) setPower(ctx context.Context, on bool) error {
-	if err := c.requireUser(ctx); err != nil {
-		return err
+func (c *Client) TurnOnForUser(ctx context.Context, userID string) error {
+	return c.setPowerForUser(ctx, userID, true)
+}
+
+func (c *Client) TurnOffForUser(ctx context.Context, userID string) error {
+	return c.setPowerForUser(ctx, userID, false)
+}
+
+func (c *Client) setPowerForUser(ctx context.Context, userID string, on bool) error {
+	targetUserID := userID
+	if targetUserID == "" {
+		if err := c.requireUser(ctx); err != nil {
+			return err
+		}
+		targetUserID = c.UserID
 	}
-	path := fmt.Sprintf("/users/%s/devices/power", c.UserID)
-	body := map[string]bool{"on": on}
-	return c.do(ctx, http.MethodPost, path, nil, body, nil)
+	path := fmt.Sprintf("/v1/users/%s/temperature", targetUserID)
+	state := "off"
+	if on {
+		state = "smart"
+	}
+	body := map[string]any{"currentState": map[string]string{"type": state}}
+	return c.doApp(ctx, http.MethodPut, path, nil, body, nil)
 }
 
 func (c *Client) Identity() tokencache.Identity {
@@ -291,17 +316,34 @@ func (c *Client) Identity() tokencache.Identity {
 	}
 }
 
-// SetTemperature sets target heating/cooling level (-100..100).
+// SetTemperature sets target heating/cooling level (-100..100) for the
+// authenticated user's current pod side.
 func (c *Client) SetTemperature(ctx context.Context, level int) error {
-	if err := c.requireUser(ctx); err != nil {
-		return err
-	}
+	return c.SetTemperatureForUser(ctx, "", level)
+}
+
+// SetTemperatureForUser sets target heating/cooling level (-100..100) for a
+// specific household user ID. If userID is empty, the authenticated user's ID
+// is resolved and used.
+func (c *Client) SetTemperatureForUser(ctx context.Context, userID string, level int) error {
 	if level < -100 || level > 100 {
 		return fmt.Errorf("level must be between -100 and 100")
 	}
-	path := fmt.Sprintf("/users/%s/temperature", c.UserID)
+	targetUserID := userID
+	if targetUserID == "" {
+		if err := c.requireUser(ctx); err != nil {
+			return err
+		}
+		targetUserID = c.UserID
+	}
+	path := fmt.Sprintf("/v1/users/%s/temperature", targetUserID)
+	if err := c.doApp(ctx, http.MethodPut, path, nil, map[string]any{
+		"currentState": map[string]string{"type": "smart"},
+	}, nil); err != nil {
+		return err
+	}
 	body := map[string]int{"currentLevel": level}
-	return c.do(ctx, http.MethodPut, path, nil, body, nil)
+	return c.doApp(ctx, http.MethodPut, path, nil, body, nil)
 }
 
 // TempStatus represents current temperature state payload.
@@ -314,12 +356,20 @@ type TempStatus struct {
 
 // GetStatus fetches temperature-based status (current mode/level).
 func (c *Client) GetStatus(ctx context.Context) (*TempStatus, error) {
-	if err := c.requireUser(ctx); err != nil {
-		return nil, err
+	return c.GetStatusForUser(ctx, "")
+}
+
+func (c *Client) GetStatusForUser(ctx context.Context, userID string) (*TempStatus, error) {
+	targetUserID := userID
+	if targetUserID == "" {
+		if err := c.requireUser(ctx); err != nil {
+			return nil, err
+		}
+		targetUserID = c.UserID
 	}
-	path := fmt.Sprintf("/users/%s/temperature", c.UserID)
+	path := fmt.Sprintf("/v1/users/%s/temperature", targetUserID)
 	var res TempStatus
-	if err := c.do(ctx, http.MethodGet, path, nil, nil, &res); err != nil {
+	if err := c.doApp(ctx, http.MethodGet, path, nil, nil, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
